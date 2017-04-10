@@ -6,33 +6,30 @@ library(dplyr)
 library(ggplot2)
 library(caret)
 
-build_graph <- function (node_file, edge_file, targeted_edge_attr , targeted_node_attr, num_pub_floor = 0 ) {
-  nodes = read.csv(node_file, header = T)
-  edges = read.csv(edge_file, header = T)
+build_graph <- function (nodes, edges ) {
   g = graph.empty(nrow(nodes), directed = FALSE)
   # covert R factor to character
   V(g)$name = as.character(nodes$Id)
   # a edge array: odd index -> source, even index -> target
   edge_list = as.vector(t(cbind(as.character(edges$Source), as.character(edges$Target))))
   g = add_edges(g, edge_list)
-  g$targeted_edge_attr = targeted_edge_attr
-  g$targeted_node_attr = targeted_node_attr
   E(g)$Label = as.character(edges$Label)
   E(g)$PUB_YEAR = as.character(edges$PUB_YEAR)
   E(g)$COUNTRY = as.character(edges$COUNTRY)
   E(g)$ACTIVITY = as.character(edges$ACTIVITY)
   V(g)$Group = as.character(nodes$Group)
-    #add edge color attribute
-  g$edge.color.lvls = levels(edges[[targeted_edge_attr]])
-  edge_colpal = brewer.pal(length(g$edge.color.lvls), 'Set1')
-  g$edge.colpal = edge_colpal
-  E(g)$color = edge_colpal[edges[[targeted_edge_attr]]]
   #remove nodes by degree 
   #g = filter_node_by_number_publication(g, num_pub_floor)
   return(g)
 }
 
+### ploting
 plot_graph <- function(g) {
+  #add edge color attribute
+  g$edge.color.lvls = levels(edges[[targeted_edge_attr]])
+  edge_colpal = brewer.pal(length(g$edge.color.lvls), 'Set1')
+  g$edge.colpal = edge_colpal
+  E(g)$color = edge_colpal[edges[[targeted_edge_attr]]]
   
   pdf_file = paste0(g$group, '.pdf')
   pdf(pdf_file, width = 8, height = 11)
@@ -45,7 +42,6 @@ plot_graph <- function(g) {
         # col="#777777", pt.bg=g$edge.colpal, pt.cex=2, cex=.8, bty="n", ncol=1)
   dev.off()
 }
-
 plot_block_heatmap <- function(g) {
   # Create a character vector containing every node name
   # Re-generate dataframes for both nodes and edges, now containing
@@ -89,13 +85,15 @@ plot_block_heatmap <- function(g) {
       legend.position = "none")
   dev.off()
 }
-get_assortativity <- function(g) {
-  cat = igraph::get.vertex.attribute(g, g$targeted_node_attr )
+### graph level stats
+# a single statistic measuring the degree of connections betweeen similiar nodes 
+get_assortativity <- function(g, attr) {
+  cat = igraph::get.vertex.attribute(g, attr )
   #!! have to convert vertex values from chartacter to factor
-  g$assortativity = assortativity_nominal(g, as.factor(cat), directed = F)
-  return(g$assortativity);
+  assortativity = assortativity_nominal(g, as.factor(cat), directed = F)
+  return(assortativity);
 }
-
+# calcuate a confusion table between groups 
 get_group_confusion <- function(nodes, edges) {
   from_to = select(edges, Source, Target)
   from_to$Source = as.character(from_to$Source)
@@ -109,28 +107,31 @@ get_group_confusion <- function(nodes, edges) {
   Target_Groups = as.factor(fg_tg$Target_Groups);
   tbl = table(Source_Groups, Target_Groups)
   prop_table = prop.table(tbl)
-  print(prop_table)
+  return(prop_table)
   #conf = confusionMatrix(tbl)
 }
-
-
-
-
-analyze_graph <- function(g, nodes, edges) {
-  # Q1 Does NIGMS researchers collaborate with each other more ofthen than with other groups
-  # assortativity
-  assortativity = get_assortativity(g)
-  print(paste0('assortativity: ', as.character(assortativity)))
-  #confusion matrix
-  get_group_confusion(nodes, edges)
-  
-  #calcuate graph level statistics
-  
-  
-  #group blocks
-  
-  
-  #clustering analysis
+# the group exhibiting more complete triad indicate a stronger culture of collaboration
+get_triad_census <- function(g) {
+  #currently not working
+  simple_g = simplify(g)
+  sna_g = asNetwork(simple_g)
+  sna::triad.census(sna_g, mode='graph')
+  #0: no edge; 1: 1 edge; 2: 2 edges; 3: 3 edges
+}
+# transitivity (clustering coefficient) measuring the probability of a author's coauthors are connected. That means more collaborations around the node
+get_transitivity <- function(g) {
+  cc = transitivity(g, type='local', vids=V(g)$name)
+  V(g)$cc = cc 
+  study_nodes = V(g)[V(g)$Group=='study']
+  comp_nodes = V(g)[V(g)$Group=='comp']
+  trs = list(2)
+  trs[[1]] = mean(study_nodes$cc, na.rm = TRUE)
+  trs[[2]] =  mean(comp_nodes$cc, na.rm = TRUE)
+  return(trs)
+}
+### clustering
+# block model clustering nodes based on similiar connections
+get_blockmodel <- function(g) {
   #sapply(cliques(g), length)
   #largest_cliques(g)
   #block modeling
@@ -139,6 +140,79 @@ analyze_graph <- function(g, nodes, edges) {
   sna_g = asNetwork(simple_g)
   eq <- equiv.clust(sna_g, mode="graph")
   b <- blockmodel(sna_g, eq, k=4)
+}
+# looping through clique to count group membership in clique 
+get_cliques_membership <- function(g, n, attr) {
+  cs  = cliques(g, min=n)
+  cs_len = sapply(cs, length)
+  cs_n = cs[cs_len == n]
+  cat = unique(igraph::get.vertex.attribute(g, attr))
+  numCli = length(cs_n)
+  m = matrix(0, nrow = numCli, ncol = length(cat))
+  colnames(m) = cat
+  #looping throught cliques to count membership by groups
+  for (i in 1:numCli) {
+    c = cs_n[[i]]
+    a = vertex_attr(g,attr, c)
+    for (ct in cat) {
+      m[i,ct] = sum(a==ct)
+    }
+  }
+  return(m)
+}
+
+
+
+
+
+analyze_graph <- function(g, nodes, edges) {
+  ## Q1 Does NIGMS researchers collaborate with each other more ofthen than with other groups
+  # 1.assortativity
+  assortativity = get_assortativity(g, 'Group')
+  print(paste(rep('#', 30),collapse = ''))
+  print(paste0('assortativity: ', as.character(assortativity)))
+  cat('\n')
+  
+  # 2. confusion matrix  dyad level
+  print(paste(rep('#', 30),collapse = ''))
+  print('Group Confusion Matrix')
+  prop_table = get_group_confusion(nodes, edges)
+  print(prop_table)
+  cat('\n')
+  
+  ## calcuate graph level statistics
+  # the ratio of the number of edges and the number of possible edges
+  print(paste(rep('#', 30),collapse = ''))
+  print(paste0('density: ', edge_density(g, loops=FALSE)))
+  cat('\n')
+  
+  ## transitivity
+  print(paste(rep('#', 30),collapse = ''))
+  trs = get_transitivity(g)
+  print('The below statistics ignore nodes without edges')
+  print(paste0('Average Study Transitivity: ', sprintf("%.6f",trs[[1]] )))
+  print(paste0('Average Comparision Transitivity: ', sprintf("%.6f", trs[[2]])))
+  print('It seems more collaborations around study nodes.')
+  cat('\n')
+  
+  
+  
+  #count group membership in complete triad graph
+  print(paste(rep('#', 30),collapse = ''))
+  n = 3 
+  m = get_cliques_membership(g, n, 'Group')
+  all_study_triad_count = sum(m[,'study'] == 3)
+  all_comp_triad_count = sum(m[,'comp'] == 3)
+  print(paste0('Counts of Complete Study Triads: ', all_study_triad_count))
+  print(paste0('Counts of Complete Comparison Triads: ', all_comp_triad_count))
+  print('While comparsion group connect with each other more at the dyad level according to confusion matrix, ')
+  print('it seems the study group connect more at triad level.')
+  cat('\n')
+  
+  
+  #group blocks
+  #clustering analysis
+  #get_blockmodel()
 }
 
 filter_node_by_number_publication <- function(g, num_pub_floor){
@@ -156,7 +230,8 @@ filter_node_by_number_publication <- function(g, num_pub_floor){
   g = igraph::delete.vertices(g, V(g)[V(g)$remove])
   return(g)
 }
-main <- function(group, targeted_edge_attr, targeted_node_attr ) {
+
+main <- function(group) {
   
   if (group == 'study') {
     ## study file
@@ -173,27 +248,28 @@ main <- function(group, targeted_edge_attr, targeted_node_attr ) {
     edge_file = '../data/study_comp_edges.csv'
   } else if (group == 'gt_10') {
     node_file = '../data/author_has_pub_gt_10_nodes_gephi.csv'
-    edge_file = '../data/author_other_has_pub_gt_10_edge.csv'
+    edge_file = '../data/author_other_has_pub_gt_10_edges.csv'
   } else {
     node_file = '../data/author_has_pub_gt_5_nodes_gephi.csv'
-    edge_file = '../data/author_other_has_pub_gt_5_edge.csv'
+    edge_file = '../data/author_other_has_pub_gt_5_edges.csv'
   }
- 
+  
+  nodes = read.csv(node_file, header = T)
+  edges = read.csv(edge_file, header = T)
 
-  ## study and cob
-
-  g <- build_graph(node_file, edge_file,  targeted_edge_attr = targeted_edge_attr,  targeted_node_attr = targeted_node_attr )
+  g <- build_graph(nodes, edges)
   g$group = group
   
-  analyze_graph(g)
-  plot_graph(g)
- 
-  #whole network 139651 nodes , 2634331 edges
-  #filter out degree 1 138775 nodes , 2633466 edges
-  print(length(V(g)))
-  print(length(E(g)))
+  print(paste(rep('#', 30),collapse = ''))
+  print(paste0('Number of nodes:',  length(V(g))))
+  print(paste0('Number of edges:', length(E(g))))
+  
+  analyze_graph(g, nodes, edges)
+  
   #plot_graph(g)
+ 
 }
 
-main('comp', targeted_edge_attr='ACTIVITY',  targeted_node_attr ='Group')
+main(group = 'study_comp')
+
 
